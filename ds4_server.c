@@ -2601,6 +2601,9 @@ static void json_escape_fragment_n(buf *b, const char *s, size_t n) {
 #define DS4_INVOKE_END_SHORT "</" DS4_DSML_SHORT "invoke>"
 #define DS4_PARAM_START_SHORT "<" DS4_DSML_SHORT "parameter"
 #define DS4_PARAM_END_SHORT "</" DS4_DSML_SHORT "parameter>"
+/* Reserve a small decode tail when tools are enabled so the model does not
+ * begin a DSML tool_calls block too close to the context/token limit. */
+#define DS4_TOOL_CALL_MIN_REMAINING_TOKENS 64
 
 static const char *find_any_tool_start(const char *s) {
     const char *best = NULL;
@@ -2626,6 +2629,27 @@ static const char *find_any_tool_end(const char *s) {
         if (candidates[i] && (!best || candidates[i] < best)) best = candidates[i];
     }
     return best;
+}
+
+static bool tool_call_start_budget_exhausted(const request *r,
+                                             bool saw_tool_start,
+                                             bool saw_tool_end,
+                                             int remaining_tokens) {
+    if (!r) return false;
+    if (r->kind != REQ_CHAT || !r->has_tools) return false;
+    if (saw_tool_start || saw_tool_end) return false;
+    if (remaining_tokens < 0) remaining_tokens = 0;
+    return remaining_tokens <= DS4_TOOL_CALL_MIN_REMAINING_TOKENS;
+}
+
+static bool trim_incomplete_tool_call_text(buf *text) {
+    if (!text || !text->ptr || text->len == 0) return false;
+    const char *start = find_any_tool_start(text->ptr);
+    if (!start) return false;
+    size_t keep = (size_t)(start - text->ptr);
+    text->len = keep;
+    text->ptr[keep] = '\0';
+    return true;
 }
 
 static void observe_tool_markers(const char *scan, bool *saw_start,
@@ -6231,6 +6255,7 @@ static void generate_job(server *s, job *j) {
     bool saw_tool_start = false;
     bool saw_tool_end = false;
     bool saw_orphan_tool_end = false;
+    bool incomplete_tool_call_near_limit = false;
     size_t tool_scan_from = 0;
     int next_tool_progress = 128;
     int next_decode_log = 50;
@@ -6246,6 +6271,15 @@ static void generate_job(server *s, job *j) {
 
     while (!g_stop_requested && completion < max_tokens &&
            ds4_session_pos(s->session) < ds4_session_ctx(s->session)) {
+        const int remaining_tokens = max_tokens - completion;
+        if (tool_call_start_budget_exhausted(&j->req, saw_tool_start, saw_tool_end,
+                                             remaining_tokens)) {
+            finish = "length";
+            trace_event(s, trace_id,
+                        "stopped early with %d decode tokens left to avoid partial tool-call block",
+                        remaining_tokens);
+            break;
+        }
         const bool in_tool_call = j->req.kind == REQ_CHAT && j->req.has_tools &&
                                   saw_tool_start && !saw_tool_end;
         float temperature = j->req.temperature;
@@ -6432,11 +6466,16 @@ static void generate_job(server *s, job *j) {
     if (j->req.kind == REQ_CHAT && j->req.has_tools &&
         saw_tool_start && !saw_tool_end && strcmp(finish, "error") != 0)
     {
-        /* A partial streamed tool call cannot be retracted.  If the model ends
-         * before closing the DSML block, fail the turn instead of letting clients
-         * execute an incomplete `{}` or partially parsed argument object. */
-        finish = "error";
-        snprintf(err, sizeof(err), "unterminated tool call");
+        incomplete_tool_call_near_limit = true;
+        finish = "length";
+        if (!j->req.stream && trim_incomplete_tool_call_text(&text)) {
+            if (plain_stream_pos > text.len) plain_stream_pos = text.len;
+            trace_event(s, trace_id,
+                        "trimmed incomplete trailing tool-call block near decode/context limit");
+        } else {
+            trace_event(s, trace_id,
+                        "incomplete tool-call block near decode/context limit; finishing gracefully");
+        }
     }
 
     if (completion > last_decode_log_completion) {
@@ -6474,7 +6513,9 @@ static void generate_job(server *s, job *j) {
             parsed_content = xstrdup(text.ptr ? text.ptr : "");
             parsed_reasoning = NULL;
             tool_calls_free(&parsed_calls);
-            if (j->req.has_tools && saw_tool_start && strcmp(final_finish, "error") != 0) {
+            if (j->req.has_tools && saw_tool_start &&
+                !incomplete_tool_call_near_limit &&
+                strcmp(final_finish, "error") != 0) {
                 final_finish = "error";
                 snprintf(err, sizeof(err), "invalid tool call");
             }
@@ -8591,6 +8632,45 @@ static void test_tool_marker_state_ignores_orphan_end(void) {
     TEST_ASSERT(saw_end);
 }
 
+static void test_tool_call_start_budget_guard(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.has_tools = true;
+
+    TEST_ASSERT(tool_call_start_budget_exhausted(&r, false, false, 64));
+    TEST_ASSERT(tool_call_start_budget_exhausted(&r, false, false, 1));
+    TEST_ASSERT(!tool_call_start_budget_exhausted(&r, false, false, 65));
+    TEST_ASSERT(!tool_call_start_budget_exhausted(&r, true, false, 1));
+    TEST_ASSERT(!tool_call_start_budget_exhausted(&r, false, true, 1));
+
+    r.has_tools = false;
+    TEST_ASSERT(!tool_call_start_budget_exhausted(&r, false, false, 1));
+    request_free(&r);
+
+    request_init(&r, REQ_COMPLETION, 128);
+    r.has_tools = true;
+    TEST_ASSERT(!tool_call_start_budget_exhausted(&r, false, false, 1));
+    request_free(&r);
+}
+
+static void test_trim_incomplete_tool_call_text(void) {
+    buf text = {0};
+    buf_puts(&text, "plain answer");
+    buf_puts(&text, "\n\n");
+    buf_puts(&text, DS4_TOOL_CALLS_START "\n");
+    buf_puts(&text, DS4_INVOKE_START " name=\"bash\">\n");
+    buf_puts(&text, DS4_PARAM_START " name=\"command\" string=\"true\">pwd");
+    TEST_ASSERT(trim_incomplete_tool_call_text(&text));
+    TEST_ASSERT(!strcmp(text.ptr, "plain answer"));
+    buf_free(&text);
+
+    buf done = {0};
+    buf_puts(&done, "plain answer");
+    TEST_ASSERT(!trim_incomplete_tool_call_text(&done));
+    TEST_ASSERT(!strcmp(done.ptr, "plain answer"));
+    buf_free(&done);
+}
+
 static void test_canonical_rewrite_rebuilds_when_live_tail_changes(void) {
     /* Regression for the first canonical-KV rewrite attempt: replacing a small
      * live suffix looks tempting because the raw SWA ring may still contain the
@@ -8892,6 +8972,8 @@ static void ds4_server_unit_tests_run(void) {
     test_client_socket_nonblocking_flag();
     test_thinking_state_tracks_prompt_and_generated_tags();
     test_tool_marker_state_ignores_orphan_end();
+    test_tool_call_start_budget_guard();
+    test_trim_incomplete_tool_call_text();
     test_canonical_rewrite_rebuilds_when_live_tail_changes();
     test_kv_cache_store_len_uses_configured_boundary();
     test_kv_cache_eviction_values_fresh_snapshots();
